@@ -1,8 +1,11 @@
 ﻿# Usage
 # cd "D:\Users\Win\Desktop\Study\毕业设计-面向大语言模型的时序推理数据构建及分析系统实现\数据收集\数据集\UEA&UCR Multivariate Time Series Classification Archive"
 # python "generate_descriptions_UEA&UCR.py" --arff_path CatsDogs\CatsDogs_TRAIN.arff --max_samples 5
+# python "generate_descriptions_UEA&UCR.py" --arff_path Multivariate\BasicMotions\BasicMotions_TRAIN.arff --window_lengths 32 --main_channels 2 4 --max_samples 5
 # 运行时可通过 --max_samples 指定生成样本数量以便快速调试。
 # --window_lengths参数可以指定多个窗口长度，默认是“ --window_lengths 512 1024”
+# 多变量场景建议使用 --main_channels（可传一个或多个）；描述使用第一个主通道，其他用于对齐 target_cols 语义。
+# --main_channel 仍可用，但仅作为兼容旧命令的别名。
 
 import argparse
 import pandas as pd
@@ -34,53 +37,57 @@ def make_json_safe(obj):
 
 def load_ucr_arff(arff_path: str):
     """
-    简单解析 UEA/UCR 的 ARFF 文件。
-    返回 (df_numeric, targets, attrs)，其中 df_numeric 每行对应一个实例的时间序列数值，
-    targets 为标签列表（若存在），attrs 为 (name,type) 元组列表。
+    改进的 UEA/UCR ARFF 解析器，支持单/多变量数据（含 relational 属性）。
+    返回 (df_numeric, targets, attrs, is_multivariate, n_channels)
     """
     attrs = []
-    data_rows = []
-    in_data = False
+    relational_attrs = []
+    in_relational = False
+    has_relational = False
+    data_line_idx = None
+
     with open(arff_path, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('%'):
-                continue
-            low = line.lower()
-            if low.startswith('@relation'):
-                continue
-            if low.startswith('@attribute'):
-                # 形如: @attribute att1 numeric 或 @attribute target {A,B}
-                parts = line.split()
-                if len(parts) >= 3:
-                    name = parts[1]
-                    typeinfo = ' '.join(parts[2:])
-                    attrs.append((name, typeinfo))
-                continue
-            if low.startswith('@data'):
-                in_data = True
-                continue
-            if in_data:
-                # 实际数据行，逗号分隔，可以存在空格
-                # 去掉末尾注释
-                if line.startswith('%'):
-                    continue
-                row = [x.strip() for x in line.split(',') if x.strip() != '']
-                if row:
-                    data_rows.append(row)
-    if not data_rows:
-        raise ValueError(f"ARFF 文件 {arff_path} 未包含数据")
-    # 找到标签属性位置
-    target_idx = None
-    for i, (name, typeinfo) in enumerate(attrs):
-        if name.lower() == 'target' or ('{' in typeinfo and 'numeric' not in typeinfo.lower()):
-            target_idx = i
+        all_text = f.read()
+
+    lines = all_text.splitlines()
+    for idx, line in enumerate(lines):
+        raw = line.strip()
+        if not raw or raw.startswith('%'):
+            continue
+        low = raw.lower()
+        if low.startswith('@data'):
+            data_line_idx = idx
             break
-    numeric_attrs = [name for name, _ in attrs[:target_idx] if target_idx is not None] if target_idx is not None else [name for name, _ in attrs]
-    # 构建 DataFrame
-    num_cols = len(numeric_attrs)
+        if low.startswith('@relation'):
+            continue
+        if low.startswith('@end'):
+            in_relational = False
+            continue
+        if low.startswith('@attribute') and 'relational' in low:
+            in_relational = True
+            has_relational = True
+            attrs.append(('relationalAtt', 'relational'))
+            continue
+        if in_relational and low.startswith('@attribute'):
+            parts = raw.split()
+            if len(parts) >= 3:
+                relational_attrs.append((parts[1], ' '.join(parts[2:])))
+            continue
+        if (not in_relational) and low.startswith('@attribute'):
+            parts = raw.split()
+            if len(parts) >= 3:
+                attrs.append((parts[1], ' '.join(parts[2:])))
+
+    if data_line_idx is None:
+        raise ValueError(f"ARFF 文件 {arff_path} 未找到 @data 段")
+
+    data_text = "\n".join(lines[data_line_idx + 1 :]).strip()
+    is_multivariate = has_relational and len(relational_attrs) > 0
+
     numeric_data = []
     targets = []
+    mv_series_list = []
+
     def parse_numeric_token(token: str) -> float:
         txt = token.strip().strip("'").strip('"')
         if txt in ('', '?'):
@@ -93,6 +100,63 @@ def load_ucr_arff(arff_path: str):
                 return float(m.group(0))
             return float('nan')
 
+    if is_multivariate:
+        # relational 格式：'ch0_t0,...\nch1_t0,...\n...\nchK_tN',Class
+        pat = re.compile(r"'(.*?)'\s*,\s*([^,\r\n]+)", flags=re.DOTALL)
+        matches = list(pat.finditer(data_text))
+        if not matches:
+            raise ValueError(f"ARFF 文件 {arff_path} 的 relational 数据段解析失败")
+
+        for m in matches:
+            block = m.group(1)
+            label = m.group(2).strip().strip("'").strip('"')
+            # UEA 多变量 ARFF 常见两种编码：真实换行 或 字符串转义 "\\n"
+            if "\\n" in block and "\n" not in block:
+                ch_lines = [ln.strip() for ln in block.split("\\n") if ln.strip()]
+            else:
+                ch_lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            rows = []
+            for ln in ch_lines:
+                vals = [parse_numeric_token(tok) for tok in ln.split(',') if tok.strip() != '']
+                if vals:
+                    rows.append(vals)
+            if not rows:
+                continue
+            min_len = min(len(r) for r in rows)
+            if min_len <= 1:
+                continue
+            arr = np.asarray([r[:min_len] for r in rows], dtype=float).T  # (time, channel)
+            mv_series_list.append(arr)
+            targets.append(label)
+
+        if not mv_series_list:
+            raise ValueError(f"ARFF 文件 {arff_path} 未解析到有效多变量样本")
+
+        n_channels = int(mv_series_list[0].shape[1])
+        df_numeric = pd.DataFrame()  # 多变量分支不使用该表
+        return df_numeric, targets, attrs, True, n_channels, mv_series_list
+
+    # 单变量格式
+    data_rows = []
+    for ln in data_text.splitlines():
+        raw = ln.strip()
+        if not raw or raw.startswith('%'):
+            continue
+        row = [x.strip() for x in raw.split(',') if x.strip() != '']
+        if row:
+            data_rows.append(row)
+
+    if not data_rows:
+        raise ValueError(f"ARFF 文件 {arff_path} 未包含有效数据行")
+
+    target_idx = None
+    for i, (name, typeinfo) in enumerate(attrs):
+        if name.lower() == 'target' or ('{' in typeinfo and 'numeric' not in typeinfo.lower()):
+            target_idx = i
+            break
+
+    numeric_attrs = [name for name, _ in attrs[:target_idx] if target_idx is not None] if target_idx is not None else [name for name, _ in attrs]
+
     for row in data_rows:
         if target_idx is not None and len(row) > target_idx:
             numeric_part = row[:target_idx]
@@ -100,10 +164,144 @@ def load_ucr_arff(arff_path: str):
         else:
             numeric_part = row
             targets.append(None)
-        # convert numeric to float
         numeric_data.append([parse_numeric_token(x) for x in numeric_part])
+
+    n_channels = 1
     df_numeric = pd.DataFrame(numeric_data, columns=numeric_attrs)
-    return df_numeric, targets, attrs
+    return df_numeric, targets, attrs, False, n_channels, None
+
+
+def _is_nearly_flat(x: np.ndarray, rel_span_thr: float = 0.08, std_rel_thr: float = 0.03) -> bool:
+    arr = np.asarray(x, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 8:
+        return True
+    q05, q95 = np.quantile(arr, [0.05, 0.95])
+    span = float(q95 - q05)
+    mean_abs = float(np.mean(np.abs(arr)))
+    std_rel = float(np.std(arr)) / max(mean_abs, 1.0)
+    scale = max(float(np.quantile(np.abs(arr), 0.90)), 1.0)
+    return span <= rel_span_thr * scale or std_rel <= std_rel_thr
+
+
+def _linkage_metrics(main_x: np.ndarray, other_x: np.ndarray) -> tuple[float | None, bool, bool]:
+    a = np.asarray(main_x, dtype=float)
+    b = np.asarray(other_x, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b)
+    a = a[mask]
+    b = b[mask]
+    if a.size < 8:
+        return None, False, True
+
+    if _is_nearly_flat(a) or _is_nearly_flat(b):
+        return None, False, True
+
+    rho = float(np.corrcoef(a, b)[0, 1])
+    if not np.isfinite(rho):
+        return None, False, False
+
+    stable = True
+    if a.size >= 24:
+        half = a.size // 2
+        if half >= 8 and (a.size - half) >= 8:
+            rho_1 = float(np.corrcoef(a[:half], b[:half])[0, 1])
+            rho_2 = float(np.corrcoef(a[half:], b[half:])[0, 1])
+            if np.isfinite(rho_1) and np.isfinite(rho_2):
+                stable = (
+                    abs(rho_1) >= 0.12
+                    and abs(rho_2) >= 0.12
+                    and rho_1 * rho_2 > 0
+                    and rho_1 * rho > 0
+                    and rho_2 * rho > 0
+                )
+            else:
+                stable = False
+
+    return rho, bool(stable), False
+
+
+def describe_window_multivariate(win: np.ndarray, dataset_name: str, instance_id: int, class_label: str | None, main_channel: int = 0) -> tuple[str, dict]:
+    # win shape: (time, channels)
+    n_steps, n_channels = int(win.shape[0]), int(win.shape[1])
+    main_channel = int(np.clip(main_channel, 0, max(0, n_channels - 1)))
+
+    # 主通道描述完全复用单变量逻辑，保持原有文本风格
+    main_series = win[:, main_channel].astype(float)
+    base_desc, base_feat = describe_window_series(main_series, dataset_name, instance_id, class_label)
+
+    channel_features = []
+    for ch in range(n_channels):
+        x = win[:, ch].astype(float)
+        g_min, g_max = float(np.min(x)), float(np.max(x))
+        g_mean, g_std = float(np.mean(x)), float(np.std(x))
+        vol_level, _ = classify_volatility(g_std, g_mean)
+        trend_label, _ = classify_global_trend(x)
+        best_lag, best_corr = estimate_period(x)
+        periodic = bool(best_lag >= 8 and best_corr >= 0.45 and not is_micro_noise_period(x, best_lag, best_corr))
+        channel_features.append(
+            {
+                "channel_idx": int(ch),
+                "length": int(n_steps),
+                "min": g_min,
+                "max": g_max,
+                "mean": g_mean,
+                "std": g_std,
+                "vol_level": vol_level,
+                "trend_label": trend_label,
+                "best_lag": int(best_lag),
+                "best_corr": float(best_corr),
+                "periodic": periodic,
+            }
+        )
+
+    # 仅补充主通道与其他通道联动关系描述
+    cross_channel_correlations = []
+    for ch in range(n_channels):
+        if ch == main_channel:
+            continue
+        rho, stable, flat = _linkage_metrics(main_series, win[:, ch].astype(float))
+        if rho is None:
+            continue
+        cross_channel_correlations.append(
+            {
+                "channels": [int(main_channel), int(ch)],
+                "correlation": float(rho),
+                "stable": bool(stable and (not flat)),
+            }
+        )
+    cross_channel_correlations.sort(key=lambda d: abs(d["correlation"]), reverse=True)
+
+    linkage_lines = []
+    for c in cross_channel_correlations[:5]:
+        i, j = c["channels"]
+        r = c["correlation"]
+        stable = c.get("stable", False)
+        if not stable:
+            linkage_lines.append(f"通道 {j} 与主通道 {i} 联动不稳定（r≈{r:.2f}）")
+        elif abs(r) >= 0.25:
+            rel = "同向" if r >= 0 else "反向"
+            linkage_lines.append(f"通道 {j} 与主通道 {i} 呈{rel}关系（r≈{r:.2f}）")
+        else:
+            linkage_lines.append(f"通道 {j} 与主通道 {i} 联动较弱（r≈{r:.2f}）")
+
+    linkage_text = "联动关系：\n" + ("；\n".join(linkage_lines) + "。" if linkage_lines else "未检测到与主通道的稳定联动关系。")
+    marker = "\n\n整体结论："
+    if marker in base_desc:
+        head, tail = base_desc.rsplit(marker, 1)
+        description = head + "\n\n" + linkage_text + marker + tail
+    else:
+        description = base_desc + "\n\n" + linkage_text
+
+    features = {
+        "is_multivariate": True,
+        "main_channel": int(main_channel),
+        "n_channels": int(n_channels),
+        "sequence_length": int(n_steps),
+        "main_channel_features": base_feat,
+        "channels": channel_features,
+        "cross_channel_correlations": cross_channel_correlations,
+    }
+    return description, features
 
 
 def sliding_window_indices(n: int, window: int, step: int):
@@ -1201,8 +1399,9 @@ def describe_window_series(series: np.ndarray, dataset_name: str, instance_id: i
             prev_mean = float(x[prev_idx:s].mean()) if s > 0 else g_mean
             change_word = "抬升" if (v - prev_mean) >= 0 else "下探"
             compare_word = "偏高" if (v - prev_mean) >= 0 else "偏低"
+            pos_text = f"第 {s} 点" if int(s) == int(e) else f"第 {s} 到 {e} 点"
             event_desc.append(
-                f"第 {s} 到 {e} 点，{var_name} 出现一次局部{change_word}（峰值约 {v:.3g}，相较此前一小段时间均值 {prev_mean:.3g} 明显{compare_word}，标准化偏离 |z|≈{abs(z):.2f}）"
+                f"{pos_text}，{var_name} 出现一次局部{change_word}（峰值约 {v:.3g}，相较此前一小段时间均值 {prev_mean:.3g} 明显{compare_word}，标准化偏离 |z|≈{abs(z):.2f}）"
             )
         lines.append("异常点：\n" + "；\n".join(event_desc) + "。")
     else:
@@ -1243,51 +1442,106 @@ def generate_ucr_jsonl(
     window_lengths=(512, 1024),
     step_ratio: float = 0.5,
     max_samples: int | None = None,
+    main_channels: list[int] | None = None,
 ):
-    df, targets, attrs = load_ucr_arff(arff_path)
-    n_instances, series_len = df.shape
+    df, targets, attrs, is_multivariate, n_channels, mv_series_list = load_ucr_arff(arff_path)
+    n_instances = len(mv_series_list) if is_multivariate else df.shape[0]
+    series_len = int(mv_series_list[0].shape[0]) if is_multivariate else int(df.shape[1])
     dataset_name = Path(arff_path).parent.name
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sample_count = 0
+    main_channels = main_channels or [0]
     with out_path.open('w', encoding='utf-8') as f:
         for idx in range(n_instances):
-            series_raw = df.iloc[idx].to_numpy(dtype=float)
-            series_s = pd.Series(series_raw, dtype='float64')
-            if series_s.notna().sum() == 0:
-                continue
-            series_s = series_s.interpolate(limit_direction='both').ffill().bfill()
-            if series_s.notna().sum() == 0:
-                continue
-            series = series_s.to_numpy(dtype=float)
             targ = targets[idx]
-            for L in window_lengths:
-                step = max(1, int(L * step_ratio))
-                for start in sliding_window_indices(series_len, L, step):
-                    end = start + L
-                    win = series[start:end]
-                    desc, feat = describe_window_series(win, dataset_name, idx, targ)
-                    sample = {
-                        "id": f"{dataset_name}_{Path(arff_path).stem}_idx{idx}_L{L}_start{start}",
-                        "dataset": dataset_name,
-                        "task": "classification",
-                        "source_file": Path(arff_path).name,
-                        "instance_index": int(idx),
-                        "class_label": targ,
-                        "window_length": L,
-                        "start_index": int(start),
-                        "end_index": int(end-1),
-                        "values": win.tolist(),
-                        "features": feat,
-                        "descriptions": [desc],
-                    }
-                    safe_sample = make_json_safe(sample)
-                    f.write(json.dumps(safe_sample, ensure_ascii=False, allow_nan=False))
-                    f.write("\n")
-                    sample_count += 1
-                    if max_samples is not None and sample_count >= max_samples:
-                        print(f"达到 max_samples={max_samples}，提前停止。")
-                        return
+            if is_multivariate:
+                mat = np.asarray(mv_series_list[idx], dtype=float)  # (time, channel)
+                # 按通道分别插值补齐
+                for ch in range(mat.shape[1]):
+                    s = pd.Series(mat[:, ch], dtype='float64')
+                    if s.notna().sum() == 0:
+                        continue
+                    s = s.interpolate(limit_direction='both').ffill().bfill()
+                    mat[:, ch] = s.to_numpy(dtype=float)
+
+                cur_len = int(mat.shape[0])
+                for L in window_lengths:
+                    if L > cur_len:
+                        continue
+                    step = max(1, int(L * step_ratio))
+                    for start in sliding_window_indices(cur_len, L, step):
+                        end = start + L
+                        win = mat[start:end, :]
+                        selected = [int(c) for c in main_channels if 0 <= int(c) < win.shape[1]]
+                        if not selected:
+                            selected = [0]
+                        main_channel = int(selected[0])
+                        desc, feat = describe_window_multivariate(win, dataset_name, idx, targ, main_channel=main_channel)
+                        sample = {
+                            "id": f"{dataset_name}_{Path(arff_path).stem}_idx{idx}_L{L}_start{start}",
+                            "dataset": dataset_name,
+                            "task": "classification",
+                            "source_file": Path(arff_path).name,
+                            "instance_index": int(idx),
+                            "class_label": targ,
+                            "is_multivariate": True,
+                            "n_channels": int(win.shape[1]),
+                            "main_channel": int(np.clip(main_channel, 0, max(0, win.shape[1] - 1))),
+                            "target_col": f"ch{int(np.clip(main_channel, 0, max(0, win.shape[1] - 1)))}",
+                            "target_cols": [f"ch{c}" for c in selected],
+                            "window_length": L,
+                            "start_index": int(start),
+                            "end_index": int(end - 1),
+                            "values": win.tolist(),
+                            "features": feat,
+                            "descriptions": [desc],
+                        }
+                        safe_sample = make_json_safe(sample)
+                        f.write(json.dumps(safe_sample, ensure_ascii=False, allow_nan=False))
+                        f.write("\n")
+                        sample_count += 1
+                        if max_samples is not None and sample_count >= max_samples:
+                            print(f"达到 max_samples={max_samples}，提前停止。")
+                            return
+            else:
+                series_raw = df.iloc[idx].to_numpy(dtype=float)
+                series_s = pd.Series(series_raw, dtype='float64')
+                if series_s.notna().sum() == 0:
+                    continue
+                series_s = series_s.interpolate(limit_direction='both').ffill().bfill()
+                if series_s.notna().sum() == 0:
+                    continue
+                series = series_s.to_numpy(dtype=float)
+                for L in window_lengths:
+                    step = max(1, int(L * step_ratio))
+                    for start in sliding_window_indices(series_len, L, step):
+                        end = start + L
+                        win = series[start:end]
+                        desc, feat = describe_window_series(win, dataset_name, idx, targ)
+                        sample = {
+                            "id": f"{dataset_name}_{Path(arff_path).stem}_idx{idx}_L{L}_start{start}",
+                            "dataset": dataset_name,
+                            "task": "classification",
+                            "source_file": Path(arff_path).name,
+                            "instance_index": int(idx),
+                            "class_label": targ,
+                            "is_multivariate": False,
+                            "n_channels": 1,
+                            "window_length": L,
+                            "start_index": int(start),
+                            "end_index": int(end-1),
+                            "values": win.tolist(),
+                            "features": feat,
+                            "descriptions": [desc],
+                        }
+                        safe_sample = make_json_safe(sample)
+                        f.write(json.dumps(safe_sample, ensure_ascii=False, allow_nan=False))
+                        f.write("\n")
+                        sample_count += 1
+                        if max_samples is not None and sample_count >= max_samples:
+                            print(f"达到 max_samples={max_samples}，提前停止。")
+                            return
     print(f"已生成 {sample_count} 个样本，保存在 {out_path}。")
 
 
@@ -1298,6 +1552,8 @@ if __name__ == '__main__':
     parser.add_argument('--window_lengths', type=int, nargs='+', default=[512, 1024], help='窗口长度列表，例如 512 1024')
     parser.add_argument('--step_ratio', type=float, default=0.5, help='滑动步长相对窗口长度的比例')
     parser.add_argument('--max_samples', type=int, default=None, help='最多生成多少个样本，默认不限制')
+    parser.add_argument('--main_channels', type=int, nargs='+', default=[0], help='多变量场景下主通道列表（默认 0），描述使用第一个通道，格式与其他多变量脚本一致')
+    parser.add_argument('--main_channel', type=int, default=None, help='兼容旧参数：单个主通道索引')
     args = parser.parse_args()
     if args.output_path is None:
         script_dir = Path(__file__).resolve().parent
@@ -1311,6 +1567,7 @@ if __name__ == '__main__':
         window_lengths=args.window_lengths,
         step_ratio=args.step_ratio,
         max_samples=args.max_samples,
+        main_channels=([args.main_channel] if args.main_channel is not None else args.main_channels),
     )
 
 
